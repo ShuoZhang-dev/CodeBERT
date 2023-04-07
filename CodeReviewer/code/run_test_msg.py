@@ -75,9 +75,10 @@ def eval_epoch_bleu(args, eval_dataloader, model, tokenizer):
     with open(os.path.join(args.model_name_or_path, "golds.txt"), "w", encoding="utf-8") as f:
         for gold in golds:
             f.write(gold.strip() + "\n")
+    bleu = bleu_fromstr(pred_nls, golds, rmstop=True)
+    logger.warning(f"WithOutStop BLEU: {bleu}")
     bleu = bleu_fromstr(pred_nls, golds, rmstop=False)
     logger.warning(f"WithStop BLEU: {bleu}")
-    bleu = bleu_fromstr(pred_nls, golds, rmstop=True)
     return bleu
 
 
@@ -104,7 +105,22 @@ def main(args):
     bleu = eval_epoch_bleu(args, dataloader, model, tokenizer)
     logger.warning(f"BLEU: {bleu}")
 
+    # save bleu score
+    if not os.path.exists(args.output_dir):
+        os.mkdir(args.output_dir)
+    eval_file_name = os.path.splitext(os.path.basename(args.eval_file))[0]
+    bleu_score_file_name = eval_file_name + "-bleu.txt"
+    bleu_score_file_path = os.path.join(args.output_dir, bleu_score_file_name)
+    with open(bleu_score_file_path, 'w') as f:
+        f.write(str(bleu))
+    logger.warning(f"BLEU score saved at {bleu_score_file_path}")
+
+    pool.close()
+    pool.join()
+
+
 if __name__ == "__main__":
+    start_time = time.time()
     parser = argparse.ArgumentParser()
     args = add_args(parser)
     args.cpu_count = multiprocessing.cpu_count()
@@ -112,5 +128,7 @@ if __name__ == "__main__":
     logging.getLogger("transformers.tokenization_utils_base").setLevel(logging.ERROR)
     logger.info(args)
     main(args)
-    logger.info("Test finished.")
+    logger.info("Test finished in {} mins.\n".format((time.time() - start_time)/60))
     # torch.multiprocessing.spawn(main, args=(args,), nprocs=torch.cuda.device_count())
+
+    os.system("kill $(ps aux | grep run_test_msg.py | grep -v grep | awk '{print $2}') ")

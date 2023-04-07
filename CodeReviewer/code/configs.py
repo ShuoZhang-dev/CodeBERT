@@ -199,6 +199,30 @@ def add_args(parser):
     parser.add_argument(
         "--seed", type=int, default=2233, help="random seed for initialization"
     )  # previous one 42
+    parser.add_argument(
+        "--intent_dict_file",
+        type=str,
+        default=None,
+        help="",
+    )
+    parser.add_argument(
+        "--num_cls",
+        type=int,
+        default=-1,
+        help="Number of intent classes",
+    )
+    parser.add_argument(
+        "--log_file",
+        type=str,
+        default=None,
+        help="Path of the log file",
+    )
+    parser.add_argument(
+        "--load_steps",
+        type=int,
+        default=0,
+        help="",
+    )
 
     args = parser.parse_args()
     return args

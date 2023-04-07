@@ -1,21 +1,24 @@
 import os
-import torch
 import torch.nn as nn
+import torch
 import torch.nn.functional as F
 from torch.nn import CrossEntropyLoss, BCEWithLogitsLoss
+import numpy as np
+from utils import MyTokenizer
 from transformers import (
+    RobertaConfig,
+    RobertaModel,
     RobertaTokenizer,
+    BartConfig,
+    BartForConditionalGeneration,
+    BartTokenizer,
     T5Config,
     T5ForConditionalGeneration,
     T5Tokenizer,
 )
-from argparse import ArgumentParser
-import json
+import logging
 
-MAX_SOURCE_LENGTH = 512
-MAX_TARGET_LENGTH = 128
-_model = None
-_tokenizer = None
+logger = logging.getLogger(__name__)
 
 
 class ReviewerModel(T5ForConditionalGeneration):
@@ -24,14 +27,6 @@ class ReviewerModel(T5ForConditionalGeneration):
         super().__init__(config)
         self.cls_head = nn.Linear(self.config.d_model, 2, bias=True)
         self.init()
-
-    @staticmethod
-    def from_pretrained(path):
-        model = T5ForConditionalGeneration.from_pretrained(path)
-        model.__class__ = ReviewerModel
-        model.cls_head = nn.Linear(model.config.d_model, 2, bias=True)
-        model.init()
-        return model
 
     def init(self):
         nn.init.xavier_uniform_(self.lm_head.weight)
@@ -162,80 +157,23 @@ class ReviewerModel(T5ForConditionalGeneration):
             return loss
         return cls_logits, lm_logits
 
-def load_model(
-    config,
-    model,
-    tokenizer_class,
-    load_extra_ids=True,
-    add_lang_ids=False,
-    tokenizer_path="",
-    from_scratch=False
-):
-    if not tokenizer_path:      # default codet5 tokenizer
-        tokenizer_path = "Salesforce/codet5-base"
-    tokenizer = tokenizer_class.from_pretrained(tokenizer_path)
+def get_model_size(model):
+    model_parameters = filter(lambda p: p.requires_grad, model.parameters())
+    model_size = sum([np.prod(p.size()) for p in model_parameters])
+    return "{}M".format(round(model_size / 1e6))
+
+
+def build_or_load_gen_model(args):
+    config_class, model_class, tokenizer_class = T5Config, ReviewerModel, RobertaTokenizer
     
-    adds = ["<pad>", "<s>", "</s>", "<unk>", "<mask>", "<keep>", "<add>", "<del>", "<start>", "<end>"]
-    adds = [tok for tok in adds if tok not in tokenizer.get_vocab()]
-    if adds:
-        tokenizer.add_special_tokens(
-            {"additional_special_tokens": adds}
-        )
-    if load_extra_ids:
-        tokenizer.add_special_tokens(
-            {
-                "additional_special_tokens": [
-                    "<extra_id_{}>".format(i) for i in range(99, -1, -1)
-                ]
-            }
-        )
-        tokenizer.add_special_tokens(
-            {
-                "additional_special_tokens": [
-                    "<e{}>".format(i) for i in range(99, -1, -1)
-                ]
-            }
-        )
-        tokenizer.add_special_tokens({"additional_special_tokens": ["<msg>"]})
-    langs = [
-        "<en>",
-        "<python>",
-        "<java>",
-        "<javascript>",
-        "<ruby>",
-        "<php>",
-        "<go>",
-        "<c>",
-        "<c_sharp>",
-        "<c_plus_plus>",
-    ]
-    if add_lang_ids:
-        tokenizer.add_special_tokens(
-            {
-                "additional_special_tokens": langs
-            }
-        )
-        config.lang_id = {
-            lang: tokenizer.get_vocab()[lang] for lang in langs
-        }
-    config.vocab_size = len(tokenizer)
-    config.bos_token_id = tokenizer.get_vocab()["<s>"]
-    config.pad_token_id = tokenizer.get_vocab()["<pad>"]
-    config.eos_token_id = tokenizer.get_vocab()["</s>"]
-    config.mask_token_id = tokenizer.get_vocab()["<mask>"]
-    config.keep_token_id = tokenizer.get_vocab()["<keep>"]
-    config.add_token_id = tokenizer.get_vocab()["<add>"]
-    config.del_token_id = tokenizer.get_vocab()["<del>"]
-    config.start_token_id = tokenizer.get_vocab()["<start>"]
-    config.end_token_id = tokenizer.get_vocab()["<end>"]
-    
-    config.lang_tokens = langs
-    model.config = config  # changing the default config of T5
-    model.resize_token_embeddings(len(tokenizer))
+    config = config_class.from_pretrained(args.model_name_or_path)
+    tokenizer = tokenizer_class.from_pretrained(args.model_name_or_path)
+    model = model_class.from_pretrained(args.model_name_or_path, config=config)
+
     tokenizer.special_dict = {
         f"<e{i}>" : tokenizer.get_vocab()[f"<e{i}>"] for i in range(99, -1, -1)
     }
-    # confusing api...
+
     tokenizer.mask_id = tokenizer.get_vocab()["<mask>"]
     tokenizer.bos_id = tokenizer.get_vocab()["<s>"]
     tokenizer.pad_id = tokenizer.get_vocab()["<pad>"]
@@ -246,109 +184,25 @@ def load_model(
     tokenizer.del_id = tokenizer.get_vocab()["<del>"]
     tokenizer.start_id = tokenizer.get_vocab()["<start>"]
     tokenizer.end_id = tokenizer.get_vocab()["<end>"]
-    
 
-    if from_scratch:
-        model = ReviewerModel(config)
-
-    return config, model, tokenizer
-
-
-def build_or_load_gen_model(args):
-    config_class, model_class, tokenizer_class = T5Config, ReviewerModel, RobertaTokenizer
-    
-    config = config_class.from_pretrained(args.model_name_or_path)
-
-    model = model_class.from_pretrained(args.model_name_or_path)
-    config, model, tokenizer = load_model(
-        config,
-        model,
-        tokenizer_class,
-        add_lang_ids=True,
-        tokenizer_path=args.model_name_or_path,
-        from_scratch=False
+    logger.info(
+        "Finish loading model [%s] from %s",
+        get_model_size(model),
+        args.model_name_or_path,
     )
-    model_name = os.path.join(args.model_name_or_path, "pytorch_model.bin")
-    try:
-        model.load_state_dict(torch.load(model_name, map_location="cpu"))
-    except:
-        saved = model.cls_head
-        model.cls_head = None
-        model.load_state_dict(torch.load(model_name, map_location="cpu"))
-        model.cls_head = saved
-    model.to(args.local_rank)
+
+    if args.load_model_path is not None:
+        model_path = os.path.join(args.load_model_path, "pytorch_model.bin")
+        logger.info("Reload model from {}".format(model_path))
+        try:
+            model.load_state_dict(torch.load(model_path, map_location="cpu"))
+        except RuntimeError:
+            saved = model.cls_head
+            model.cls_head = None
+            model.load_state_dict(torch.load(model_path, map_location="cpu"))
+            model.cls_head = saved
+        model.to(args.local_rank)
+
     return config, model, tokenizer
 
-
-def pad_assert(source_ids):
-    source_ids = source_ids[:MAX_SOURCE_LENGTH - 2]
-    source_ids = [_tokenizer.bos_id] + source_ids + [_tokenizer.eos_id]
-    pad_len = MAX_SOURCE_LENGTH - len(source_ids)
-    source_ids += [_tokenizer.pad_id] * pad_len
-    assert len(source_ids) == MAX_SOURCE_LENGTH, "Not equal length."
-    return source_ids
-
-def encode_diff(diff):
-    difflines = diff.split("\n")[1:]        # remove start @@
-    difflines = [line for line in difflines if len(line.strip()) > 0]
-    map_dic = {"-": 0, "+": 1, " ": 2}
-    def f(s):
-        if s in map_dic:
-            return map_dic[s]
-        else:
-            return 2
-    labels = [f(line[0]) for line in difflines]
-    difflines = [line[1:].strip() for line in difflines]
-    inputstr = ""
-    for label, line in zip(labels, difflines):
-        if label == 1:
-            inputstr += "<add>" + line
-        elif label == 0:
-            inputstr += "<del>" + line
-        else:
-            inputstr += "<keep>" + line
-    source_ids = _tokenizer.encode(inputstr, max_length=MAX_SOURCE_LENGTH, truncation=True)[1:-1]
-    source_ids = pad_assert(source_ids)
-    return source_ids
-
-
-def init(model_dir):
-    global _model, _tokenizer
-    _, _model, _tokenizer = build_or_load_gen_model(model_dir)
-
-
-def run(inputs):
-    input_obj = json.loads(inputs)
-    CodeDiff, BeamSize, NumReturns = input_obj["CodeDiff"], input_obj["BeamSize"], input_obj["NumReturns"]
-    inputs = torch.tensor([encode_diff(CodeDiff)], dtype=torch.long).to("cuda")
-    inputs_mask = inputs.ne(_tokenizer.pad_id)
-    preds = _model.generate(inputs,
-                           attention_mask=inputs_mask,
-                           use_cache=True,
-                           num_beams=BeamSize,
-                           early_stopping=True,
-                           max_length=MAX_TARGET_LENGTH,
-                           num_return_sequences=NumReturns
-                           )
-    preds = list(preds.cpu().numpy())
-    pred_nls = [_tokenizer.decode(id[2:], skip_special_tokens=True, clean_up_tokenization_spaces=False) for id in preds]
-    return pred_nls
-
-if __name__ == "__main__":
-    parser = ArgumentParser()
-    parser.add_argument("--model_dir", type=str, required=True)
-    parser.add_argument("--code_diff", type=str, default="")
-    parser.add_argument("--beam_size", type=int, default=10)
-    parser.add_argument("--num_returns", type=int, default=5)
-    args = parser.parse_args()
-    init(args.model_dir)
-    code_diff = """@@ -11,6 +11,8 @@\n \n         invoiceDtoCopy.setState(InvoiceState.OPEN);\n         _invoiceAggregateRepository.updateInvoiceState(invoiceCopy, InvoiceState.OPEN);\n+        _erpIntegrationService.createAndSendInvoiceEvent(invoiceCopy);\n+\n       }\n     }\n \n"""
-
-    inputs = json.dumps({
-        "CodeDiff": code_diff,
-        "BeamSize": args.beam_size,
-        "NumReturns": args.num_returns
-    })
-    result = run(inputs)
-    print(result)
 

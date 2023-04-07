@@ -1,35 +1,29 @@
-import os
-import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.nn import CrossEntropyLoss, BCEWithLogitsLoss
+from torch.nn import CrossEntropyLoss
+import numpy as np
 from transformers import (
     RobertaTokenizer,
     T5Config,
     T5ForConditionalGeneration,
     T5Tokenizer,
 )
-from argparse import ArgumentParser
-import json
+import logging
 
-MAX_SOURCE_LENGTH = 512
-MAX_TARGET_LENGTH = 128
-_model = None
-_tokenizer = None
+logger = logging.getLogger(__name__)
 
 
 class ReviewerModel(T5ForConditionalGeneration):
 
     def __init__(self, config):
         super().__init__(config)
-        self.cls_head = nn.Linear(self.config.d_model, 2, bias=True)
+        self.cls_head = nn.Linear(self.config.d_model, config.num_cls, bias=True)
         self.init()
 
     @staticmethod
-    def from_pretrained(path):
+    def from_pretrained(path, num_cls):
         model = T5ForConditionalGeneration.from_pretrained(path)
         model.__class__ = ReviewerModel
-        model.cls_head = nn.Linear(model.config.d_model, 2, bias=True)
+        model.cls_head = nn.Linear(model.config.d_model, num_cls, bias=True)
         model.init()
         return model
 
@@ -110,9 +104,10 @@ class ReviewerModel(T5ForConditionalGeneration):
             return_dict=False
         )
         hidden_states = encoder_outputs[0]
-        first_hidden = hidden_states[:, 0, :]
-        first_hidden = nn.Dropout(0.3)(first_hidden)
-        logits = self.cls_head(first_hidden)
+        mean_hidden = (hidden_states*attention_mask[:,:,None]).sum(1)/attention_mask.sum(-1)[:,None]
+        # first_hidden = hidden_states[:, 0, :]
+        mean_hidden = nn.Dropout(0.2)(mean_hidden)
+        logits = self.cls_head(mean_hidden)
         loss_fct = CrossEntropyLoss()
         if labels != None:
             loss = loss_fct(logits, labels)
@@ -149,18 +144,27 @@ class ReviewerModel(T5ForConditionalGeneration):
         if self.config.tie_word_embeddings: # this is True default
             sequence_output = sequence_output * (self.model_dim ** -0.5)
         if encoder_loss:
-            # print(self.encoder.get_input_embeddings().weight.shape)
-            cls_logits = nn.functional.linear(hidden_states, self.encoder.get_input_embeddings().weight)
-            # cls_logits = self.cls_head(hidden_states)
+            if len(input_labels.shape) > 1 :
+                cls_logits = nn.functional.linear(hidden_states, self.encoder.get_input_embeddings().weight)
+            else:
+                mean_hidden = (hidden_states*attention_mask[:,:,None]).sum(1)/attention_mask.sum(-1)[:,None]
+                mean_hidden = nn.Dropout(0.2)(mean_hidden)
+                cls_logits = self.cls_head(mean_hidden)
         lm_logits = self.lm_head(sequence_output)
         if decoder_input_ids is not None:
             lm_loss_fct = CrossEntropyLoss(ignore_index=0)      # Warning: PAD_ID should be 0
             loss = lm_loss_fct(lm_logits.view(-1, lm_logits.size(-1)), decoder_input_ids.view(-1))
             if encoder_loss and input_labels is not None:
                 cls_loss_fct = CrossEntropyLoss(ignore_index=-100)
-                loss += cls_loss_fct(cls_logits.view(-1, cls_logits.size(-1)), input_labels.view(-1))
+                loss += 0.5*cls_loss_fct(cls_logits.view(-1, cls_logits.size(-1)), input_labels.view(-1))
             return loss
         return cls_logits, lm_logits
+
+
+MODEL_CLASSES = {
+    "t5": (T5Config, ReviewerModel, T5Tokenizer),
+    "codet5": (T5Config, ReviewerModel, RobertaTokenizer),
+}
 
 def load_model(
     config,
@@ -176,6 +180,7 @@ def load_model(
     tokenizer = tokenizer_class.from_pretrained(tokenizer_path)
     
     adds = ["<pad>", "<s>", "</s>", "<unk>", "<mask>", "<keep>", "<add>", "<del>", "<start>", "<end>"]
+    # adds = ["<pad>", "<s>", "</s>", "<unk>", "<mask>"]
     adds = [tok for tok in adds if tok not in tokenizer.get_vocab()]
     if adds:
         tokenizer.add_special_tokens(
@@ -254,101 +259,7 @@ def load_model(
     return config, model, tokenizer
 
 
-def build_or_load_gen_model(args):
-    config_class, model_class, tokenizer_class = T5Config, ReviewerModel, RobertaTokenizer
-    
-    config = config_class.from_pretrained(args.model_name_or_path)
-
-    model = model_class.from_pretrained(args.model_name_or_path)
-    config, model, tokenizer = load_model(
-        config,
-        model,
-        tokenizer_class,
-        add_lang_ids=True,
-        tokenizer_path=args.model_name_or_path,
-        from_scratch=False
-    )
-    model_name = os.path.join(args.model_name_or_path, "pytorch_model.bin")
-    try:
-        model.load_state_dict(torch.load(model_name, map_location="cpu"))
-    except:
-        saved = model.cls_head
-        model.cls_head = None
-        model.load_state_dict(torch.load(model_name, map_location="cpu"))
-        model.cls_head = saved
-    model.to(args.local_rank)
-    return config, model, tokenizer
-
-
-def pad_assert(source_ids):
-    source_ids = source_ids[:MAX_SOURCE_LENGTH - 2]
-    source_ids = [_tokenizer.bos_id] + source_ids + [_tokenizer.eos_id]
-    pad_len = MAX_SOURCE_LENGTH - len(source_ids)
-    source_ids += [_tokenizer.pad_id] * pad_len
-    assert len(source_ids) == MAX_SOURCE_LENGTH, "Not equal length."
-    return source_ids
-
-def encode_diff(diff):
-    difflines = diff.split("\n")[1:]        # remove start @@
-    difflines = [line for line in difflines if len(line.strip()) > 0]
-    map_dic = {"-": 0, "+": 1, " ": 2}
-    def f(s):
-        if s in map_dic:
-            return map_dic[s]
-        else:
-            return 2
-    labels = [f(line[0]) for line in difflines]
-    difflines = [line[1:].strip() for line in difflines]
-    inputstr = ""
-    for label, line in zip(labels, difflines):
-        if label == 1:
-            inputstr += "<add>" + line
-        elif label == 0:
-            inputstr += "<del>" + line
-        else:
-            inputstr += "<keep>" + line
-    source_ids = _tokenizer.encode(inputstr, max_length=MAX_SOURCE_LENGTH, truncation=True)[1:-1]
-    source_ids = pad_assert(source_ids)
-    return source_ids
-
-
-def init(model_dir):
-    global _model, _tokenizer
-    _, _model, _tokenizer = build_or_load_gen_model(model_dir)
-
-
-def run(inputs):
-    input_obj = json.loads(inputs)
-    CodeDiff, BeamSize, NumReturns = input_obj["CodeDiff"], input_obj["BeamSize"], input_obj["NumReturns"]
-    inputs = torch.tensor([encode_diff(CodeDiff)], dtype=torch.long).to("cuda")
-    inputs_mask = inputs.ne(_tokenizer.pad_id)
-    preds = _model.generate(inputs,
-                           attention_mask=inputs_mask,
-                           use_cache=True,
-                           num_beams=BeamSize,
-                           early_stopping=True,
-                           max_length=MAX_TARGET_LENGTH,
-                           num_return_sequences=NumReturns
-                           )
-    preds = list(preds.cpu().numpy())
-    pred_nls = [_tokenizer.decode(id[2:], skip_special_tokens=True, clean_up_tokenization_spaces=False) for id in preds]
-    return pred_nls
-
-if __name__ == "__main__":
-    parser = ArgumentParser()
-    parser.add_argument("--model_dir", type=str, required=True)
-    parser.add_argument("--code_diff", type=str, default="")
-    parser.add_argument("--beam_size", type=int, default=10)
-    parser.add_argument("--num_returns", type=int, default=5)
-    args = parser.parse_args()
-    init(args.model_dir)
-    code_diff = """@@ -11,6 +11,8 @@\n \n         invoiceDtoCopy.setState(InvoiceState.OPEN);\n         _invoiceAggregateRepository.updateInvoiceState(invoiceCopy, InvoiceState.OPEN);\n+        _erpIntegrationService.createAndSendInvoiceEvent(invoiceCopy);\n+\n       }\n     }\n \n"""
-
-    inputs = json.dumps({
-        "CodeDiff": code_diff,
-        "BeamSize": args.beam_size,
-        "NumReturns": args.num_returns
-    })
-    result = run(inputs)
-    print(result)
-
+def get_model_size(model):
+    model_parameters = filter(lambda p: p.requires_grad, model.parameters())
+    model_size = sum([np.prod(p.size()) for p in model_parameters])
+    return "{}M".format(round(model_size / 1e6))
