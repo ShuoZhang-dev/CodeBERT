@@ -6,6 +6,8 @@ from torch.utils.data import Dataset
 from tokenizers import ByteLevelBPETokenizer
 from transformers import T5Tokenizer, RobertaTokenizer
 import nltk
+import numpy as np
+from sklearn.metrics import classification_report
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
@@ -43,7 +45,7 @@ class MyTokenizer(object):
     def convert_ids_to_tokens(self, ids):
         vocab = self.id2token
         return [vocab[i] for i in ids]
-    
+
     def decode(self, ids, **kwargs):    ##### to be update
         tokens = self.convert_ids_to_tokens(ids)
         return " ".join(tokens)
@@ -79,7 +81,7 @@ class RefineDataset(Dataset):
         logger.info(f"Tokenize examples: {file_path}")
         self.feats = pool.map(self.tokenize, \
             [(example, tokenizer, args) for example in examples])
-        
+
     def tokenize(self, item):
         example, tokenizer, args = item
         oldlines = example["old"].split("\n")
@@ -171,7 +173,7 @@ class Seq2SeqDataset(RefineDataset):
         tgtids = self.encode_remove(tokenizer, outputs, args)
         srcids, tgtids = self.pad_assert(srcids, tgtids, args, tokenizer)
         return RefineFeatures(example["id"], srcids, tgtids)
-    
+
     @staticmethod
     def process_pred_gold(pred, gold):
         gold = " ".join(gold.split())
@@ -803,10 +805,10 @@ def read_review_examples(filename, data_num=-1, tokenizer=None):
                     break
             else:
                 # print(f"Passing {idx} because of invalid diff.")
-                idx += 1 
+                idx += 1
                 if idx == data_num:
                     break
-                
+
     return examples
 
 
@@ -821,3 +823,23 @@ def read_jsonl(path):
                 continue
             data.append(js)
     return data
+
+
+def calculate_report_dict_based_on_confidence_threshold(gold, all_scores, threshold=None):
+    assert len(gold) == all_scores.shape[0]
+
+    pred = []
+    for i in range(len(gold)):
+        conf_scores = all_scores[i]
+        highest_score = np.max(conf_scores)
+        highest_index = np.argmax(conf_scores)
+        if threshold is None:
+            pred.append(highest_index)
+        else:
+            if highest_score >= threshold:
+                pred.append(highest_index)
+            else:
+                pred.append(0)
+
+    report_dict = classification_report(gold, pred, digits=4, output_dict=True)
+    return report_dict

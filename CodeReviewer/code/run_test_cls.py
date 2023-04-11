@@ -1,4 +1,5 @@
 import os
+import json
 import torch
 import logging
 import argparse
@@ -15,7 +16,7 @@ from models import build_or_load_gen_model
 from configs import add_args, set_seed, set_dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
-from utils import CommentClsDataset, SimpleClsDataset
+from utils import CommentClsDataset, SimpleClsDataset, calculate_report_dict_based_on_confidence_threshold
 from sklearn.metrics import classification_report
 
 
@@ -49,6 +50,7 @@ def eval_epoch_acc(args, eval_dataloader, model, tokenizer):
     model.eval()
     local_rank = 0
     pred, gold = [], []
+    all_scores = np.empty((0, 2), float)
     with torch.no_grad():
         for step, examples in enumerate(tqdm(eval_dataloader), 1):
             if step == 1:
@@ -69,8 +71,23 @@ def eval_epoch_acc(args, eval_dataloader, model, tokenizer):
             prediction = torch.argmax(logits, dim=-1).cpu().numpy()
             pred.extend(prediction)
             gold.extend([ex.y for ex in examples])
+
+            normalized_score = torch.nn.functional.softmax(logits, dim=-1)
+            all_scores = np.append(all_scores, normalized_score.cpu().numpy(), axis=0)
     logger.info("\n" + classification_report(gold, pred, digits=4))
     logger.info(f"Target positive percentage: {sum(gold) / len(gold)}")
+
+    # applying threshold for confidence score
+    thresholds = [x/100 for x in range(50, 100, 5)]
+    result_dict = {}
+    for thred in thresholds:
+        result_dict[str(thred)] = calculate_report_dict_based_on_confidence_threshold(gold, all_scores, threshold=thred)
+    if not os.path.exists(args.output_dir):
+        os.mkdir(args.output_dir)
+    conf_result_output_path = os.path.join(args.output_dir, "test_result_by_threshold.json")
+    with open(conf_result_output_path, 'w') as fp:
+        json.dump(result_dict, fp)
+
     return
 
 
@@ -96,6 +113,7 @@ def main(args):
     model.eval()
     eval_epoch_acc(args, dataloader, model, tokenizer)
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     args = add_args(parser)
@@ -106,3 +124,5 @@ if __name__ == "__main__":
     main(args)
     logger.info("Test finished.")
     # torch.multiprocessing.spawn(main, args=(args,), nprocs=torch.cuda.device_count())
+
+    os.system("kill $(ps aux | grep run_test_msg.py | grep -v grep | awk '{print $2}') ")
